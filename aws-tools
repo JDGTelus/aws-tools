@@ -1,0 +1,1148 @@
+#!/usr/bin/env bash
+
+#==============================================================================
+# aws-tools - AWS CLI Workflow Enhancement Tool
+#==============================================================================
+# A professional CLI utility for managing AWS profiles, CodeCommit PRs,
+# and CodePipeline deployments with an interactive experience.
+#==============================================================================
+
+set -euo pipefail
+
+# Colors and formatting
+readonly RESET='\033[0m'
+readonly BOLD='\033[1m'
+readonly DIM='\033[2m'
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[0;33m'
+readonly BLUE='\033[0;34m'
+readonly CYAN='\033[0;36m'
+readonly MAGENTA='\033[0;35m'
+
+# Configuration
+readonly CONFIG_DIR="$HOME/.aws-tools"
+readonly STATE_FILE="$CONFIG_DIR/state"
+readonly CACHE_DIR="$CONFIG_DIR/cache"
+readonly AWS_CONFIG_FILE="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
+
+# Global state
+CURRENT_PROFILE=""
+CURRENT_REPO=""
+CURRENT_PIPELINE=""
+
+#==============================================================================
+# Utility Functions
+#==============================================================================
+
+print_header() {
+    echo -e "\n${BOLD}${CYAN}═══════════════════════════════════════════════════════${RESET}"
+    echo -e "${BOLD}${CYAN}  $1${RESET}"
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════${RESET}\n"
+}
+
+print_info() {
+    echo -e "${BLUE}ℹ${RESET} $1"
+}
+
+print_success() {
+    echo -e "${GREEN}✓${RESET} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}⚠${RESET} $1"
+}
+
+print_error() {
+    echo -e "${RED}✗${RESET} $1" >&2
+}
+
+print_item() {
+    echo -e "${DIM}→${RESET} $1"
+}
+
+print_cache_info() {
+    local timestamp=$1
+    local age_seconds=$(($(date +%s) - timestamp))
+    local age_str=""
+    
+    if [[ $age_seconds -lt 60 ]]; then
+        age_str="${age_seconds}s ago"
+    elif [[ $age_seconds -lt 3600 ]]; then
+        age_str="$((age_seconds / 60))m ago"
+    elif [[ $age_seconds -lt 86400 ]]; then
+        age_str="$((age_seconds / 3600))h ago"
+    else
+        age_str="$((age_seconds / 86400))d ago"
+    fi
+    
+    local timestamp_formatted
+    timestamp_formatted=$(date -r "$timestamp" "+%Y-%m-%d %H:%M:%S")
+    
+    echo -e "${DIM}Cached: $timestamp_formatted ($age_str)${RESET}"
+}
+
+#==============================================================================
+# Cache Management
+#==============================================================================
+
+get_cache_file() {
+    local cache_type=$1
+    local identifier=$2
+    echo "$CACHE_DIR/${cache_type}_${identifier}.json"
+}
+
+read_cache() {
+    local cache_file=$1
+    if [[ -f "$cache_file" ]]; then
+        cat "$cache_file"
+    else
+        echo ""
+    fi
+}
+
+write_cache() {
+    local cache_file=$1
+    local data=$2
+    local timestamp
+    timestamp=$(date +%s)
+    
+    jq -n \
+        --arg ts "$timestamp" \
+        --argjson data "$data" \
+        '{timestamp: $ts, data: $data}' > "$cache_file"
+}
+
+get_cache_timestamp() {
+    local cache_file=$1
+    if [[ -f "$cache_file" ]]; then
+        jq -r '.timestamp // empty' "$cache_file" 2>/dev/null || echo ""
+    else
+        echo ""
+    fi
+}
+
+spinner() {
+    local pid=$1
+    local delay=0.1
+    local spinstr='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local temp
+    while ps -p "$pid" > /dev/null 2>&1; do
+        temp=${spinstr#?}
+        printf " ${CYAN}%c${RESET}  " "$spinstr"
+        spinstr=$temp${spinstr%"$temp"}
+        sleep $delay
+        printf "\b\b\b\b\b"
+    done
+    printf "    \b\b\b\b"
+}
+
+#==============================================================================
+# State Management
+#==============================================================================
+
+init_state() {
+    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$CACHE_DIR"
+    if [[ -f "$STATE_FILE" ]]; then
+        source "$STATE_FILE"
+    fi
+}
+
+save_state() {
+    cat > "$STATE_FILE" <<EOF
+CURRENT_PROFILE="$CURRENT_PROFILE"
+CURRENT_REPO="$CURRENT_REPO"
+CURRENT_PIPELINE="$CURRENT_PIPELINE"
+EOF
+}
+
+#==============================================================================
+# AWS Profile Management
+#==============================================================================
+
+get_profiles() {
+    grep '^\[profile ' "$AWS_CONFIG_FILE" | sed 's/\[profile \(.*\)\]/\1/' | sort
+}
+
+get_current_aws_profile() {
+    echo "${AWS_PROFILE:-default}"
+}
+
+switch_profile() {
+    print_header "AWS Profile Switcher"
+    
+    local profiles
+    profiles=$(get_profiles)
+    
+    if [[ -z "$profiles" ]]; then
+        print_error "No profiles found in $AWS_CONFIG_FILE"
+        return 1
+    fi
+    
+    echo -e "${BOLD}Current Profile:${RESET} ${GREEN}$(get_current_aws_profile)${RESET}\n"
+    echo -e "${BOLD}Available Profiles:${RESET}"
+    
+    PS3=$'\n\033[0;36mSelect profile (enter number):\033[0m '
+    select profile in $profiles "Cancel"; do
+        if [[ "$profile" == "Cancel" ]]; then
+            print_info "Profile switch cancelled"
+            return 0
+        elif [[ -n "$profile" ]]; then
+            export AWS_PROFILE="$profile"
+            CURRENT_PROFILE="$profile"
+            save_state
+            print_success "Switched to profile: ${BOLD}$profile${RESET}"
+            
+            # Check if SSO login is needed
+            if ! aws sts get-caller-identity &>/dev/null; then
+                print_warning "Profile requires SSO login"
+                print_info "Run: ${BOLD}aws sso login --profile $profile${RESET}"
+            else
+                local account_id
+                account_id=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "unknown")
+                print_info "Account ID: ${DIM}$account_id${RESET}"
+            fi
+            return 0
+        else
+            print_error "Invalid selection"
+        fi
+    done
+}
+
+#==============================================================================
+# CodeCommit Repository Management
+#==============================================================================
+
+list_repositories() {
+    aws codecommit list-repositories --query 'repositories[*].repositoryName' --output text 2>/dev/null | tr '\t' '\n' | sort
+}
+
+check_repo_exists() {
+    local repo_name=$1
+    local repos=$2
+    echo "$repos" | grep -q "^${repo_name}$"
+}
+
+select_repository() {
+    if [[ -z "${AWS_PROFILE:-}" ]]; then
+        print_header "CodeCommit Repository Browser"
+        print_error "No AWS profile selected. Please switch profile first."
+        read -rp $'\n'"Press enter to continue..."
+        return 0
+    fi
+    
+    # If repo already selected, go directly to repository menu
+    if [[ -n "$CURRENT_REPO" ]]; then
+        repository_menu
+        return 0
+    fi
+    
+    # No repo selected, show selection menu
+    print_header "CodeCommit Repository Browser"
+    print_info "Loading repositories for profile: ${BOLD}$AWS_PROFILE${RESET}"
+    
+    local repos
+    repos=$(list_repositories)
+    
+    if [[ -z "$repos" ]]; then
+        print_warning "No repositories found in this account"
+        read -rp $'\n'"Press enter to continue..."
+        return 0
+    fi
+    
+    echo -e "\n${BOLD}Available Repositories:${RESET}"
+    
+    PS3=$'\n\033[0;36mSelect repository (enter number):\033[0m '
+    select repo in $repos "Back"; do
+        if [[ "$repo" == "Back" ]]; then
+            return 0
+        elif [[ -n "$repo" ]]; then
+            CURRENT_REPO="$repo"
+            save_state
+            print_success "Selected repository: ${BOLD}$repo${RESET}"
+            repository_menu
+            return 0
+        else
+            print_error "Invalid selection"
+        fi
+    done
+}
+
+repository_menu() {
+    while true; do
+        print_header "Repository: $CURRENT_REPO"
+        
+        echo -e "${BOLD}What would you like to do?${RESET}\n"
+        echo -e "  ${BOLD}1)${RESET} View Pull Requests"
+        echo -e "  ${BOLD}2)${RESET} Repository Information"
+        echo -e "  ${BOLD}3)${RESET} Change Repository"
+        echo -e "  ${BOLD}4)${RESET} Back to Main Menu"
+        
+        echo -en "\n\033[0;36mEnter choice [1-4]:\033[0m "
+        read -r choice
+        
+        case $choice in
+            1) view_pull_requests ;;
+            2) show_repo_info ;;
+            3) 
+                CURRENT_REPO=""
+                save_state
+                select_repository
+                return
+                ;;
+            4) return ;;
+            *) print_error "Invalid choice" ;;
+        esac
+    done
+}
+
+show_repo_info() {
+    print_header "Repository Information"
+    
+    local cache_file
+    cache_file=$(get_cache_file "repo_info" "${AWS_PROFILE}_${CURRENT_REPO}")
+    local cache_data
+    cache_data=$(read_cache "$cache_file")
+    
+    # Display cached data if available
+    if [[ -n "$cache_data" ]]; then
+        local cache_timestamp
+        cache_timestamp=$(get_cache_timestamp "$cache_file")
+        
+        local repo_id
+        local clone_url_http
+        local clone_url_ssh
+        local description
+        local created_date
+        
+        repo_id=$(echo "$cache_data" | jq -r '.data.repositoryMetadata.repositoryId // "N/A"')
+        clone_url_http=$(echo "$cache_data" | jq -r '.data.repositoryMetadata.cloneUrlHttp // "N/A"')
+        clone_url_ssh=$(echo "$cache_data" | jq -r '.data.repositoryMetadata.cloneUrlSsh // "N/A"')
+        description=$(echo "$cache_data" | jq -r '.data.repositoryMetadata.repositoryDescription // "No description"')
+        created_date=$(echo "$cache_data" | jq -r '.data.repositoryMetadata.creationDate // "N/A"')
+        
+        echo -e "${BOLD}Name:${RESET}        $CURRENT_REPO"
+        echo -e "${BOLD}ID:${RESET}          ${DIM}$repo_id${RESET}"
+        echo -e "${BOLD}Description:${RESET} $description"
+        echo -e "${BOLD}Created:${RESET}     $created_date"
+        echo -e "\n${BOLD}Clone URLs:${RESET}"
+        echo -e "  ${DIM}HTTPS:${RESET} $clone_url_http"
+        echo -e "  ${DIM}SSH:${RESET}   $clone_url_ssh"
+        
+        echo ""
+        print_cache_info "$cache_timestamp"
+        
+        echo -e "\n${BOLD}What would you like to do?${RESET}\n"
+        echo -e "  ${BOLD}1)${RESET} Refresh data from AWS"
+        echo -e "  ${BOLD}2)${RESET} Back to repository menu"
+        
+        echo -en "\n\033[0;36mEnter choice [1-2]:\033[0m "
+        read -r choice
+        
+        case $choice in
+            1)
+                # Continue to fetch fresh data
+                ;;
+            2)
+                return 0
+                ;;
+            *)
+                print_error "Invalid choice"
+                return 0
+                ;;
+        esac
+    fi
+    
+    # Fetch fresh data
+    print_info "Fetching repository details..."
+    
+    local repo_info
+    local error_output
+    error_output=$(mktemp)
+    repo_info=$(aws codecommit get-repository --repository-name "$CURRENT_REPO" 2>"$error_output")
+    local exit_code=$?
+    
+    if [[ $exit_code -ne 0 ]]; then
+        print_error "Repository '${BOLD}$CURRENT_REPO${RESET}' not found in current profile"
+        print_info "Current profile: ${BOLD}$AWS_PROFILE${RESET}"
+        rm -f "$error_output"
+        
+        echo -e "\n${BOLD}What would you like to do?${RESET}\n"
+        echo -e "  ${BOLD}1)${RESET} Change to a different AWS profile"
+        echo -e "  ${BOLD}2)${RESET} Select a different repository"
+        echo -e "  ${BOLD}3)${RESET} Back to repository menu"
+        
+        echo -en "\n\033[0;36mEnter choice [1-3]:\033[0m "
+        read -r choice
+        
+        case $choice in
+            1)
+                switch_profile
+                return 0
+                ;;
+            2)
+                CURRENT_REPO=""
+                save_state
+                select_repository
+                return 0
+                ;;
+            3)
+                return 0
+                ;;
+            *)
+                print_error "Invalid choice"
+                return 0
+                ;;
+        esac
+    fi
+    rm -f "$error_output"
+    
+    # Cache the result
+    write_cache "$cache_file" "$repo_info"
+    
+    local repo_id
+    local clone_url_http
+    local clone_url_ssh
+    local description
+    local created_date
+    
+    repo_id=$(echo "$repo_info" | jq -r '.repositoryMetadata.repositoryId // "N/A"')
+    clone_url_http=$(echo "$repo_info" | jq -r '.repositoryMetadata.cloneUrlHttp // "N/A"')
+    clone_url_ssh=$(echo "$repo_info" | jq -r '.repositoryMetadata.cloneUrlSsh // "N/A"')
+    description=$(echo "$repo_info" | jq -r '.repositoryMetadata.repositoryDescription // "No description"')
+    created_date=$(echo "$repo_info" | jq -r '.repositoryMetadata.creationDate // "N/A"')
+    
+    print_success "Data refreshed"
+    echo ""
+    echo -e "${BOLD}Name:${RESET}        $CURRENT_REPO"
+    echo -e "${BOLD}ID:${RESET}          ${DIM}$repo_id${RESET}"
+    echo -e "${BOLD}Description:${RESET} $description"
+    echo -e "${BOLD}Created:${RESET}     $created_date"
+    echo -e "\n${BOLD}Clone URLs:${RESET}"
+    echo -e "  ${DIM}HTTPS:${RESET} $clone_url_http"
+    echo -e "  ${DIM}SSH:${RESET}   $clone_url_ssh"
+    
+    read -rp $'\n'"Press enter to continue..."
+}
+
+view_pull_requests() {
+    print_header "Pull Requests: $CURRENT_REPO"
+    
+    local cache_file
+    cache_file=$(get_cache_file "prs" "${AWS_PROFILE}_${CURRENT_REPO}")
+    local cache_data
+    cache_data=$(read_cache "$cache_file")
+    local should_fetch=true
+    
+    # Display cached data if available
+    if [[ -n "$cache_data" ]]; then
+        local cache_timestamp
+        cache_timestamp=$(get_cache_timestamp "$cache_file")
+        
+        local pr_ids_json
+        pr_ids_json=$(echo "$cache_data" | jq -r '.data.pr_ids // []')
+        
+        if [[ "$pr_ids_json" == "[]" || "$pr_ids_json" == "null" ]]; then
+            print_warning "No open pull requests found (cached)"
+            print_cache_info "$cache_timestamp"
+            
+            echo -e "\n${BOLD}What would you like to do?${RESET}\n"
+            echo -e "  ${BOLD}1)${RESET} Refresh data from AWS"
+            echo -e "  ${BOLD}2)${RESET} Back to repository menu"
+            
+            echo -en "\n\033[0;36mEnter choice [1-2]:\033[0m "
+            read -r choice
+            
+            case $choice in
+                1) should_fetch=true ;;
+                2) return 0 ;;
+                *) print_error "Invalid choice"; return 0 ;;
+            esac
+        else
+            local pr_ids
+            local pr_count
+            # Read PR IDs into array (compatible with bash 3+)
+            IFS=$'\n' read -d '' -r -a pr_ids < <(echo "$pr_ids_json" | jq -r '.[]') || true
+            pr_count=${#pr_ids[@]}
+            local pr_details_json
+            pr_details_json=$(echo "$cache_data" | jq -r '.data.pr_details // {}')
+            
+            print_success "Found ${BOLD}$pr_count${RESET} open pull request(s) (cached)"
+            print_cache_info "$cache_timestamp"
+            
+            echo -e "\n${BOLD}What would you like to do?${RESET}\n"
+            echo -e "  ${BOLD}1)${RESET} View cached PR details"
+            echo -e "  ${BOLD}2)${RESET} Refresh data from AWS"
+            echo -e "  ${BOLD}3)${RESET} Back to repository menu"
+            
+            echo -en "\n\033[0;36mEnter choice [1-3]:\033[0m "
+            read -r choice
+            
+            case $choice in
+                1)
+                    # Display cached PRs
+                    echo -e "\n${BOLD}Open Pull Requests:${RESET}\n"
+                    
+                    local count=0
+                    for pr_id in "${pr_ids[@]}"; do
+                        ((count++))
+                        local title author source dest
+                        title=$(echo "$pr_details_json" | jq -r --arg id "$pr_id" '.[$id].title // "No title"')
+                        author=$(echo "$pr_details_json" | jq -r --arg id "$pr_id" '.[$id].author // "unknown"')
+                        source=$(echo "$pr_details_json" | jq -r --arg id "$pr_id" '.[$id].source // "unknown"')
+                        dest=$(echo "$pr_details_json" | jq -r --arg id "$pr_id" '.[$id].dest // "unknown"')
+                        
+                        echo -e "${BOLD}[$count] PR #$pr_id${RESET}"
+                        echo -e "    ${CYAN}$title${RESET}"
+                        echo -e "    ${DIM}by $author | $source → $dest${RESET}\n"
+                    done
+                    
+                    PS3=$'\n\033[0;36mSelect PR to view details (or enter number):\033[0m '
+                    select choice in "${pr_ids[@]}" "Back"; do
+                        if [[ "$choice" == "Back" ]]; then
+                            return 0
+                        elif [[ -n "$choice" ]]; then
+                            show_pr_details "$choice"
+                        else
+                            print_error "Invalid selection"
+                        fi
+                    done
+                    return 0
+                    ;;
+                2)
+                    should_fetch=true
+                    ;;
+                3)
+                    return 0
+                    ;;
+                *)
+                    print_error "Invalid choice"
+                    return 0
+                    ;;
+            esac
+        fi
+    fi
+    
+    if [[ "$should_fetch" == false ]]; then
+        return 0
+    fi
+    
+    # Fetch fresh data
+    print_info "Fetching pull requests..."
+    
+    local prs
+    local error_output
+    error_output=$(mktemp)
+    prs=$(aws codecommit list-pull-requests \
+        --repository-name "$CURRENT_REPO" \
+        --pull-request-status OPEN \
+        --query 'pullRequestIds' \
+        --output text 2>"$error_output")
+    local exit_code=$?
+    
+    if [[ $exit_code -ne 0 ]]; then
+        print_error "Repository '${BOLD}$CURRENT_REPO${RESET}' not found in current profile"
+        print_info "Current profile: ${BOLD}$AWS_PROFILE${RESET}"
+        rm -f "$error_output"
+        
+        echo -e "\n${BOLD}What would you like to do?${RESET}\n"
+        echo -e "  ${BOLD}1)${RESET} Change to a different AWS profile"
+        echo -e "  ${BOLD}2)${RESET} Select a different repository"
+        echo -e "  ${BOLD}3)${RESET} Back to repository menu"
+        
+        echo -en "\n\033[0;36mEnter choice [1-3]:\033[0m "
+        read -r choice
+        
+        case $choice in
+            1)
+                switch_profile
+                return 0
+                ;;
+            2)
+                CURRENT_REPO=""
+                save_state
+                select_repository
+                return 0
+                ;;
+            3)
+                return 0
+                ;;
+            *)
+                print_error "Invalid choice"
+                return 0
+                ;;
+        esac
+    fi
+    rm -f "$error_output"
+    
+    if [[ -z "$prs" || "$prs" == "None" ]]; then
+        # Cache empty result
+        write_cache "$cache_file" '{"pr_ids": [], "pr_details": {}}'
+        print_warning "No open pull requests found"
+        read -rp $'\n'"Press enter to continue..."
+        return 0
+    fi
+    
+    # Convert to array
+    local pr_ids=($prs)
+    local pr_count=${#pr_ids[@]}
+    
+    print_success "Found ${BOLD}$pr_count${RESET} open pull request(s)"
+    
+    # Ask if user wants to fetch details
+    echo -e "\n${BOLD}What would you like to do?${RESET}\n"
+    echo -e "  ${BOLD}1)${RESET} Load PR details and view"
+    echo -e "  ${BOLD}2)${RESET} Back to repository menu"
+    
+    echo -en "\n\033[0;36mEnter choice [1-2]:\033[0m "
+    read -r choice
+    
+    case $choice in
+        1)
+            # Continue to fetch details
+            ;;
+        2)
+            return 0
+            ;;
+        *)
+            print_error "Invalid choice"
+            return 0
+            ;;
+    esac
+    
+    # Fetch all PR details
+    echo -e "\n${BOLD}Loading PR details...${RESET}"
+    
+    # Build JSON cache object
+    local pr_details_json="{"
+    local first=true
+    
+    local count=0
+    for pr_id in "${pr_ids[@]}"; do
+        ((count++))
+        echo -ne "  Fetching PR #$pr_id ($count/$pr_count)...\r"
+        
+        local pr_data
+        pr_data=$(aws codecommit get-pull-request --pull-request-id "$pr_id" 2>/dev/null)
+        
+        local title author source dest
+        title=$(echo "$pr_data" | jq -r '.pullRequest.title // "No title"')
+        author=$(echo "$pr_data" | jq -r '.pullRequest.authorArn // "unknown"' | awk -F'/' '{print $NF}')
+        source=$(echo "$pr_data" | jq -r '.pullRequest.pullRequestTargets[0].sourceReference // "unknown"' | sed 's/refs\/heads\///')
+        dest=$(echo "$pr_data" | jq -r '.pullRequest.pullRequestTargets[0].destinationReference // "unknown"' | sed 's/refs\/heads\///')
+        
+        # Escape JSON strings
+        title=$(echo "$title" | jq -Rs .)
+        author=$(echo "$author" | jq -Rs .)
+        source=$(echo "$source" | jq -Rs .)
+        dest=$(echo "$dest" | jq -Rs .)
+        
+        if [[ "$first" == true ]]; then
+            first=false
+        else
+            pr_details_json+=","
+        fi
+        
+        pr_details_json+="\"$pr_id\":{\"title\":$title,\"author\":$author,\"source\":$source,\"dest\":$dest}"
+    done
+    pr_details_json+="}"
+    
+    # Cache the results
+    local cache_payload
+    cache_payload=$(jq -n \
+        --argjson pr_ids "$(printf '%s\n' "${pr_ids[@]}" | jq -R . | jq -s .)" \
+        --argjson pr_details "$pr_details_json" \
+        '{pr_ids: $pr_ids, pr_details: $pr_details}')
+    write_cache "$cache_file" "$cache_payload"
+    
+    echo -e "\n\n${BOLD}Open Pull Requests:${RESET}\n"
+    
+    count=0
+    for pr_id in "${pr_ids[@]}"; do
+        ((count++))
+        
+        local title author source dest
+        title=$(echo "$pr_details_json" | jq -r --arg id "$pr_id" '.[$id].title')
+        author=$(echo "$pr_details_json" | jq -r --arg id "$pr_id" '.[$id].author')
+        source=$(echo "$pr_details_json" | jq -r --arg id "$pr_id" '.[$id].source')
+        dest=$(echo "$pr_details_json" | jq -r --arg id "$pr_id" '.[$id].dest')
+        
+        echo -e "${BOLD}[$count] PR #$pr_id${RESET}"
+        echo -e "    ${CYAN}$title${RESET}"
+        echo -e "    ${DIM}by $author | $source → $dest${RESET}\n"
+    done
+    
+    PS3=$'\n\033[0;36mSelect PR to view details (or enter number):\033[0m '
+    select choice in "${pr_ids[@]}" "Back"; do
+        if [[ "$choice" == "Back" ]]; then
+            return 0
+        elif [[ -n "$choice" ]]; then
+            show_pr_details "$choice"
+        else
+            print_error "Invalid selection"
+        fi
+    done
+}
+
+show_pr_details() {
+    local pr_id=$1
+    
+    print_header "Pull Request #$pr_id"
+    
+    print_info "Fetching PR details..."
+    
+    local pr_data
+    pr_data=$(aws codecommit get-pull-request --pull-request-id "$pr_id" 2>/dev/null)
+    
+    local title
+    local description
+    local author
+    local created
+    local source
+    local dest
+    local status
+    
+    title=$(echo "$pr_data" | jq -r '.pullRequest.title // "No title"')
+    description=$(echo "$pr_data" | jq -r '.pullRequest.description // "No description"')
+    author=$(echo "$pr_data" | jq -r '.pullRequest.authorArn // "unknown"' | awk -F'/' '{print $NF}')
+    created=$(echo "$pr_data" | jq -r '.pullRequest.creationDate // "unknown"')
+    source=$(echo "$pr_data" | jq -r '.pullRequest.pullRequestTargets[0].sourceReference // "unknown"' | sed 's/refs\/heads\///')
+    dest=$(echo "$pr_data" | jq -r '.pullRequest.pullRequestTargets[0].destinationReference // "unknown"' | sed 's/refs\/heads\///')
+    status=$(echo "$pr_data" | jq -r '.pullRequest.pullRequestStatus // "unknown"')
+    
+    echo -e "${BOLD}Title:${RESET}       $title"
+    echo -e "${BOLD}Author:${RESET}      $author"
+    echo -e "${BOLD}Status:${RESET}      ${GREEN}$status${RESET}"
+    echo -e "${BOLD}Created:${RESET}     $created"
+    echo -e "${BOLD}Branch:${RESET}      ${CYAN}$source${RESET} → ${CYAN}$dest${RESET}"
+    echo -e "\n${BOLD}Description:${RESET}\n$description"
+    
+    # Show approval state
+    echo -e "\n${BOLD}${CYAN}Approval Information:${RESET}"
+    
+    local approval_rules
+    approval_rules=$(echo "$pr_data" | jq -r '.pullRequest.approvalRules // []')
+    
+    if [[ "$approval_rules" != "[]" && -n "$approval_rules" ]]; then
+        echo "$approval_rules" | jq -r '.[] | "  Rule: \(.approvalRuleName) - \(.approvalRuleContent)"'
+    else
+        echo -e "  ${DIM}No approval rules defined${RESET}"
+    fi
+    
+    echo -e "\n${BOLD}${YELLOW}How to Approve/Decline this PR:${RESET}"
+    echo -e "\n${BOLD}To APPROVE:${RESET}"
+    echo -e "  ${DIM}aws codecommit update-pull-request-approval-state \\${RESET}"
+    echo -e "  ${DIM}    --pull-request-id $pr_id \\${RESET}"
+    echo -e "  ${DIM}    --revision-id <revision-id> \\${RESET}"
+    echo -e "  ${DIM}    --approval-state APPROVE${RESET}"
+    
+    echo -e "\n${BOLD}To DECLINE (REVOKE):${RESET}"
+    echo -e "  ${DIM}aws codecommit update-pull-request-approval-state \\${RESET}"
+    echo -e "  ${DIM}    --pull-request-id $pr_id \\${RESET}"
+    echo -e "  ${DIM}    --revision-id <revision-id> \\${RESET}"
+    echo -e "  ${DIM}    --approval-state REVOKE${RESET}"
+    
+    echo -e "\n${BOLD}To MERGE:${RESET}"
+    echo -e "  ${DIM}aws codecommit merge-pull-request-by-fast-forward \\${RESET}"
+    echo -e "  ${DIM}    --pull-request-id $pr_id \\${RESET}"
+    echo -e "  ${DIM}    --repository-name $CURRENT_REPO${RESET}"
+    
+    read -rp $'\n'"Press enter to continue..."
+}
+
+#==============================================================================
+# CodePipeline Management
+#==============================================================================
+
+list_pipelines() {
+    aws codepipeline list-pipelines --query 'pipelines[*].name' --output text 2>/dev/null | tr '\t' '\n' | sort
+}
+
+select_pipeline() {
+    if [[ -z "${AWS_PROFILE:-}" ]]; then
+        print_header "CodePipeline Browser"
+        print_error "No AWS profile selected. Please switch profile first."
+        read -rp $'\n'"Press enter to continue..."
+        return 0
+    fi
+    
+    # If pipeline already selected, go directly to pipeline menu
+    if [[ -n "$CURRENT_PIPELINE" ]]; then
+        pipeline_menu
+        return 0
+    fi
+    
+    # No pipeline selected, show selection menu
+    print_header "CodePipeline Browser"
+    print_info "Loading pipelines for profile: ${BOLD}$AWS_PROFILE${RESET}"
+    
+    local pipelines
+    pipelines=$(list_pipelines)
+    
+    if [[ -z "$pipelines" ]]; then
+        print_warning "No pipelines found in this account"
+        read -rp $'\n'"Press enter to continue..."
+        return 0
+    fi
+    
+    echo -e "\n${BOLD}Available Pipelines:${RESET}"
+    
+    PS3=$'\n\033[0;36mSelect pipeline (enter number):\033[0m '
+    select pipeline in $pipelines "Back"; do
+        if [[ "$pipeline" == "Back" ]]; then
+            return 0
+        elif [[ -n "$pipeline" ]]; then
+            CURRENT_PIPELINE="$pipeline"
+            save_state
+            print_success "Selected pipeline: ${BOLD}$pipeline${RESET}"
+            pipeline_menu
+            return 0
+        else
+            print_error "Invalid selection"
+        fi
+    done
+}
+
+pipeline_menu() {
+    while true; do
+        print_header "Pipeline: $CURRENT_PIPELINE"
+        
+        echo -e "${BOLD}What would you like to do?${RESET}\n"
+        echo -e "  ${BOLD}1)${RESET} View Pipeline Status"
+        echo -e "  ${BOLD}2)${RESET} Change Pipeline"
+        echo -e "  ${BOLD}3)${RESET} Back to Main Menu"
+        
+        echo -en "\n\033[0;36mEnter choice [1-3]:\033[0m "
+        read -r choice
+        
+        case $choice in
+            1) show_pipeline_details "$CURRENT_PIPELINE" ;;
+            2) 
+                CURRENT_PIPELINE=""
+                save_state
+                select_pipeline
+                return
+                ;;
+            3) return ;;
+            *) print_error "Invalid choice" ;;
+        esac
+    done
+}
+
+show_pipeline_details() {
+    local pipeline_name=$1
+    
+    print_header "Pipeline: $pipeline_name"
+    
+    local cache_file
+    cache_file=$(get_cache_file "pipeline" "${AWS_PROFILE}_${pipeline_name}")
+    local cache_data
+    cache_data=$(read_cache "$cache_file")
+    local should_fetch=true
+    
+    # Display cached data if available
+    if [[ -n "$cache_data" ]]; then
+        local cache_timestamp
+        cache_timestamp=$(get_cache_timestamp "$cache_file")
+        local state
+        state=$(echo "$cache_data" | jq -r '.data')
+        
+        display_pipeline_state "$state" "$pipeline_name"
+        
+        echo ""
+        print_cache_info "$cache_timestamp"
+        
+        echo -e "\n${BOLD}What would you like to do?${RESET}\n"
+        echo -e "  ${BOLD}1)${RESET} Refresh data from AWS"
+        echo -e "  ${BOLD}2)${RESET} Back to pipeline menu"
+        
+        echo -en "\n\033[0;36mEnter choice [1-2]:\033[0m "
+        read -r choice
+        
+        case $choice in
+            1)
+                should_fetch=true
+                ;;
+            2)
+                return 0
+                ;;
+            *)
+                print_error "Invalid choice"
+                return 0
+                ;;
+        esac
+    fi
+    
+    if [[ "$should_fetch" == false ]]; then
+        return 0
+    fi
+    
+    # Fetch fresh data
+    print_info "Fetching pipeline state..."
+    
+    local state
+    local error_output
+    error_output=$(mktemp)
+    state=$(aws codepipeline get-pipeline-state --name "$pipeline_name" 2>"$error_output")
+    local exit_code=$?
+    
+    if [[ $exit_code -ne 0 ]]; then
+        print_error "Pipeline '${BOLD}$pipeline_name${RESET}' not found in current profile"
+        print_info "Current profile: ${BOLD}$AWS_PROFILE${RESET}"
+        rm -f "$error_output"
+        
+        echo -e "\n${BOLD}What would you like to do?${RESET}\n"
+        echo -e "  ${BOLD}1)${RESET} Change to a different AWS profile"
+        echo -e "  ${BOLD}2)${RESET} Select a different pipeline"
+        echo -e "  ${BOLD}3)${RESET} Back to pipeline menu"
+        
+        echo -en "\n\033[0;36mEnter choice [1-3]:\033[0m "
+        read -r choice
+        
+        case $choice in
+            1)
+                switch_profile
+                return 0
+                ;;
+            2)
+                CURRENT_PIPELINE=""
+                save_state
+                select_pipeline
+                return 0
+                ;;
+            3)
+                return 0
+                ;;
+            *)
+                print_error "Invalid choice"
+                return 0
+                ;;
+        esac
+    fi
+    rm -f "$error_output"
+    
+    # Cache the result
+    write_cache "$cache_file" "$state"
+    
+    print_success "Data refreshed"
+    echo ""
+    
+    display_pipeline_state "$state" "$pipeline_name"
+    
+    read -rp $'\n'"Press enter to continue..."
+}
+
+display_pipeline_state() {
+    local state=$1
+    local pipeline_name=$2
+    
+    local updated
+    local pipeline_execution_id
+    updated=$(echo "$state" | jq -r '.updated // "unknown"')
+    pipeline_execution_id=$(echo "$state" | jq -r '.pipelineExecutionId // "unknown"')
+    
+    echo -e "${BOLD}Last Updated:${RESET} $updated"
+    echo -e "${BOLD}Execution ID:${RESET} ${DIM}$pipeline_execution_id${RESET}\n"
+    
+    # Show stages
+    echo -e "${BOLD}${CYAN}Pipeline Stages:${RESET}\n"
+    
+    local stages
+    stages=$(echo "$state" | jq -c '.stageStates[]')
+    
+    local stage_num=1
+    while IFS= read -r stage; do
+        local stage_name
+        local stage_status
+        local action_states
+        local latest_execution_token
+        
+        stage_name=$(echo "$stage" | jq -r '.stageName')
+        stage_status=$(echo "$stage" | jq -r '.latestExecution.status // "No execution"')
+        latest_execution_token=$(echo "$stage" | jq -r '.latestExecution.pipelineExecutionId // ""')
+        action_states=$(echo "$stage" | jq -c '.actionStates[]?')
+        
+        # Colorize status
+        local status_colored
+        case $stage_status in
+            Succeeded) status_colored="${GREEN}✓ Succeeded${RESET}" ;;
+            InProgress) status_colored="${YELLOW}⟳ In Progress${RESET}" ;;
+            Failed) status_colored="${RED}✗ Failed${RESET}" ;;
+            *) status_colored="${DIM}$stage_status${RESET}" ;;
+        esac
+        
+        echo -e "${BOLD}[$stage_num] $stage_name${RESET} - $status_colored"
+        
+        # Show execution token for this stage
+        if [[ -n "$latest_execution_token" ]]; then
+            echo -e "  ${DIM}Execution Token: $latest_execution_token${RESET}"
+        fi
+        
+        # Check for approval actions
+        if echo "$action_states" | jq -e 'select(.actionName | contains("Approval"))' &>/dev/null; then
+            while IFS= read -r action; do
+                local action_name
+                local action_status
+                local token
+                
+                action_name=$(echo "$action" | jq -r '.actionName')
+                action_status=$(echo "$action" | jq -r '.latestExecution.status // "Waiting"')
+                token=$(echo "$action" | jq -r '.latestExecution.token // ""')
+                
+                if [[ "$action_status" == "InProgress" && -n "$token" ]]; then
+                    echo -e "  ${YELLOW}⚠ Approval Required:${RESET} $action_name"
+                    echo -e "  ${DIM}Approval Token: $token${RESET}"
+                fi
+            done <<< "$action_states"
+        fi
+        
+        # Show action details
+        if [[ -n "$action_states" ]]; then
+            while IFS= read -r action; do
+                local action_name
+                local action_status
+                local external_execution_id
+                local commit_id
+                
+                action_name=$(echo "$action" | jq -r '.actionName')
+                action_status=$(echo "$action" | jq -r '.latestExecution.status // "Pending"')
+                external_execution_id=$(echo "$action" | jq -r '.latestExecution.externalExecutionId // ""')
+                
+                # Try to extract commit ID from external execution (for CodeCommit sources)
+                commit_id=$(echo "$action" | jq -r '.currentRevision.revisionId // ""')
+                
+                local action_status_colored
+                case $action_status in
+                    Succeeded) action_status_colored="${GREEN}✓${RESET}" ;;
+                    InProgress) action_status_colored="${YELLOW}⟳${RESET}" ;;
+                    Failed) action_status_colored="${RED}✗${RESET}" ;;
+                    *) action_status_colored="${DIM}○${RESET}" ;;
+                esac
+                
+                echo -e "    $action_status_colored $action_name ${DIM}($action_status)${RESET}"
+                
+                # Show commit ID if available (from CodeCommit source action)
+                if [[ -n "$commit_id" ]]; then
+                    echo -e "      ${DIM}Commit: ${commit_id:0:8}...${RESET}"
+                fi
+                
+                # Show external execution ID if different from commit
+                if [[ -n "$external_execution_id" && "$external_execution_id" != "$commit_id" ]]; then
+                    echo -e "      ${DIM}Execution: $external_execution_id${RESET}"
+                fi
+            done <<< "$action_states"
+        fi
+        
+        echo ""
+        ((stage_num++))
+    done <<< "$stages"
+    
+    # Show how to approve
+    echo -e "${BOLD}${YELLOW}How to Approve a Stage:${RESET}"
+    echo -e "\n${BOLD}When a stage requires approval:${RESET}"
+    echo -e "  ${DIM}aws codepipeline put-approval-result \\${RESET}"
+    echo -e "  ${DIM}    --pipeline-name $pipeline_name \\${RESET}"
+    echo -e "  ${DIM}    --stage-name <stage-name> \\${RESET}"
+    echo -e "  ${DIM}    --action-name <approval-action-name> \\${RESET}"
+    echo -e "  ${DIM}    --result summary=\"Approved\",status=Approved \\${RESET}"
+    echo -e "  ${DIM}    --token <approval-token>${RESET}"
+    
+    echo -e "\n${BOLD}To REJECT:${RESET}"
+    echo -e "  ${DIM}Use status=Rejected instead of status=Approved${RESET}"
+    
+    echo -e "\n${BOLD}To view execution details:${RESET}"
+    echo -e "  ${DIM}aws codepipeline get-pipeline-execution \\${RESET}"
+    echo -e "  ${DIM}    --pipeline-name $pipeline_name \\${RESET}"
+    echo -e "  ${DIM}    --pipeline-execution-id <execution-id>${RESET}"
+}
+
+#==============================================================================
+# Main Menu
+#==============================================================================
+
+show_banner() {
+    echo -e "${BOLD}${CYAN}"
+    cat << "EOF"
+    ╔═══════════════════════════════════════════════════╗
+    ║                                                   ║
+    ║               AWS-TOOLS CLI                       ║
+    ║        AWS Workflow Enhancement Utility           ║
+    ║                                                   ║
+    ╚═══════════════════════════════════════════════════╝
+EOF
+    echo -e "${RESET}"
+}
+
+show_status() {
+    local profile="${AWS_PROFILE:-none}"
+    local repo="${CURRENT_REPO:-none}"
+    local pipeline="${CURRENT_PIPELINE:-none}"
+    
+    echo -e "${BOLD}Current Context:${RESET}"
+    echo -e "  ${CYAN}Profile:${RESET}    $profile"
+    echo -e "  ${CYAN}Repository:${RESET} $repo"
+    echo -e "  ${CYAN}Pipeline:${RESET}   $pipeline"
+    echo ""
+}
+
+main_menu() {
+    while true; do
+        clear
+        show_banner
+        show_status
+        
+        echo -e "${BOLD}Main Menu:${RESET}\n"
+        echo -e "  ${BOLD}1)${RESET} Switch AWS Profile"
+        echo -e "  ${BOLD}2)${RESET} Browse CodeCommit Repositories"
+        echo -e "  ${BOLD}3)${RESET} Browse CodePipelines"
+        echo -e "  ${BOLD}4)${RESET} Exit"
+        
+        echo -en "\n\033[0;36mEnter choice [1-4]:\033[0m "
+        read -r choice
+        
+        case $choice in
+            1) switch_profile ;;
+            2) select_repository ;;
+            3) select_pipeline ;;
+            4) 
+                echo -e "\n${GREEN}Goodbye!${RESET}\n"
+                exit 0
+                ;;
+            *)
+                print_error "Invalid choice"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+#==============================================================================
+# Main Entry Point
+#==============================================================================
+
+main() {
+    # Check dependencies
+    for cmd in aws jq; do
+        if ! command -v "$cmd" &> /dev/null; then
+            print_error "Required command not found: $cmd"
+            exit 1
+        fi
+    done
+    
+    # Initialize state
+    init_state
+    
+    # Restore profile if saved
+    if [[ -n "$CURRENT_PROFILE" ]]; then
+        export AWS_PROFILE="$CURRENT_PROFILE"
+    fi
+    
+    # Start main menu
+    main_menu
+}
+
+# Run if executed directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
